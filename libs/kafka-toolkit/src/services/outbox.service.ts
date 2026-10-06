@@ -10,6 +10,7 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
   private producer: Producer;
   private intervalId: NodeJS.Timeout | null = null;
   private isProcessing = false;
+  private isConnected = false;
 
   constructor(
     @InjectRepository(OutboxEntity)
@@ -24,24 +25,37 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit() {
-    try {
-      await this.producer.connect();
-      // Start polling outbox every 500 ms as specified in architecture document
-      this.intervalId = setInterval(() => this.processOutbox(), 500);
-    } catch (err: any) {
-      this.logger.warn(`Could not start outbox processor immediately: ${err.message}`);
-    }
+    // Start polling outbox every 500 ms unconditionally
+    this.intervalId = setInterval(() => this.processOutbox(), 500);
+
+    // Initial connection attempt with graceful retry
+    this.ensureConnected().catch((err) => {
+      this.logger.warn(`Initial Kafka connection pending in outbox: ${err.message}`);
+    });
   }
 
   async onModuleDestroy() {
     if (this.intervalId) {
       clearInterval(this.intervalId);
     }
-    await this.producer.disconnect();
+    if (this.isConnected) {
+      try {
+        await this.producer.disconnect();
+      } catch (e) {}
+    }
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (!this.isConnected) {
+      await this.producer.connect();
+      this.isConnected = true;
+      this.logger.log('Outbox Kafka producer connected successfully');
+    }
   }
 
   /**
    * Adds an event to the outbox table inside the same transaction
+   * and immediately triggers the poller so there is no lag.
    */
   async addEvent(
     topic: string,
@@ -56,7 +70,12 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
       payload,
       status: 'PENDING',
     });
-    return await repo.save(entry);
+    const saved = await repo.save(entry);
+
+    // Trigger immediate flush asynchronously
+    setImmediate(() => this.processOutbox());
+
+    return saved;
   }
 
   private async processOutbox() {
@@ -64,6 +83,8 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
     this.isProcessing = true;
 
     try {
+      await this.ensureConnected();
+
       const pendingEvents = await this.outboxRepo.find({
         where: { status: 'PENDING' },
         order: { createdAt: 'ASC' },
@@ -84,15 +105,14 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
           event.status = 'SENT';
           event.sentAt = new Date();
           await this.outboxRepo.save(event);
+          this.logger.log(`[Outbox] Sent event [${event.topic}] for key: ${event.key}`);
         } catch (err: any) {
-          this.logger.error(`Failed to publish outbox event ${event.id}: ${err.message}`);
-          event.status = 'FAILED';
-          event.error = err.message;
-          await this.outboxRepo.save(event);
+          this.logger.error(`[Outbox] Failed to send message for ${event.id}: ${err.message}`);
         }
       }
     } catch (err: any) {
-      this.logger.debug(`Outbox polling error: ${err.message}`);
+      this.isConnected = false;
+      this.logger.debug(`Outbox connection retry needed: ${err.message}`);
     } finally {
       this.isProcessing = false;
     }

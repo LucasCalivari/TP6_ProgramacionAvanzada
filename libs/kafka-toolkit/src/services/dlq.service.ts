@@ -1,10 +1,11 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { Kafka, Producer } from 'kafkajs';
 
 @Injectable()
-export class DlqService {
+export class DlqService implements OnModuleDestroy {
   private readonly logger = new Logger(DlqService.name);
   private producer: Producer;
+  private isConnected = false;
 
   constructor() {
     const brokers = (process.env.KAFKA_BROKERS || 'localhost:9092').split(',');
@@ -15,16 +16,19 @@ export class DlqService {
     this.producer = kafka.producer();
   }
 
-  async onModuleInit() {
-    try {
-      await this.producer.connect();
-    } catch (err: any) {
-      this.logger.warn(`Could not connect DLQ producer immediately: ${err.message}`);
+  async onModuleDestroy() {
+    if (this.isConnected) {
+      try {
+        await this.producer.disconnect();
+      } catch (e) {}
     }
   }
 
-  async onModuleDestroy() {
-    await this.producer.disconnect();
+  private async ensureConnected() {
+    if (!this.isConnected) {
+      await this.producer.connect();
+      this.isConnected = true;
+    }
   }
 
   /**
@@ -35,6 +39,7 @@ export class DlqService {
     this.logger.error(`Sending failed event to DLQ topic [${dlqTopic}]: ${errorReason}`);
 
     try {
+      await this.ensureConnected();
       await this.producer.send({
         topic: dlqTopic,
         messages: [
@@ -52,6 +57,7 @@ export class DlqService {
       });
       this.logger.log(`Successfully moved message to ${dlqTopic}`);
     } catch (err: any) {
+      this.isConnected = false;
       this.logger.error(`Failed to publish message to DLQ [${dlqTopic}]: ${err.message}`);
     }
   }
