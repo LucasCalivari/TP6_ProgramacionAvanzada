@@ -1,6 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource } from 'typeorm';
 import { v4 as uuidv4 } from 'uuid';
 import { ProvisioningOrderEntity } from '../entities/provisioning-order.entity';
 import {
@@ -14,10 +13,10 @@ import { IdempotencyService, OutboxService } from '@activation-poc/kafka-toolkit
 @Injectable()
 export class ProvisioningService {
   private readonly logger = new Logger(ProvisioningService.name);
+  private readonly consumerGroup = process.env.KAFKA_GROUP_ID || 'provisioning-svc';
 
   constructor(
-    @InjectRepository(ProvisioningOrderEntity)
-    private readonly repo: Repository<ProvisioningOrderEntity>,
+    private readonly dataSource: DataSource,
     private readonly idempotencyService: IdempotencyService,
     private readonly outboxService: OutboxService,
   ) {}
@@ -25,13 +24,8 @@ export class ProvisioningService {
   async handleActivationRequested(event: ActivationRequestedEvent) {
     const { eventId, eventType, correlationId, customerId, payload } = event;
 
-    // Check idempotency (RNF-03)
-    const isNew = await this.idempotencyService.checkAndRecord(
-      eventId,
-      eventType,
-      process.env.KAFKA_GROUP_ID || 'provisioning-svc',
-    );
-    if (!isNew) {
+    // Evita el retardo simulado para un duplicado obvio; la garantía real es checkAndRecord
+    if (await this.idempotencyService.isProcessed(eventId)) {
       this.logger.warn(`Event ${eventId} already processed by provisioning-service, skipping.`);
       return;
     }
@@ -42,74 +36,77 @@ export class ProvisioningService {
     await new Promise((resolve) => setTimeout(resolve, delay));
 
     const now = new Date().toISOString();
+    const isFailure = payload.simulateFailure === 'provisioning';
+    const orderId = `prov-${uuidv4().substring(0, 8)}`;
 
-    // Check if failure simulation requested for provisioning
-    if (payload.simulateFailure === 'provisioning') {
-      this.logger.warn(`Simulating provisioning network failure for activation [${correlationId}]`);
+    // Idempotencia, orden y evento de salida en la misma transacción (RNF-03)
+    await this.dataSource.transaction(async (manager) => {
+      const isNew = await this.idempotencyService.checkAndRecord(eventId, eventType, this.consumerGroup, manager);
+      if (!isNew) {
+        return;
+      }
 
-      const orderId = `prov-${uuidv4().substring(0, 8)}`;
-      const order = this.repo.create({
-        id: orderId,
-        activationId: correlationId,
-        customerId,
-        planId: payload.planId,
-        status: 'FAILED',
-        failureReason: 'Simulated network allocation timeout / HLR failure',
-      });
-      await this.repo.save(order);
+      const repo = manager.getRepository(ProvisioningOrderEntity);
 
-      const failedEvent: ProvisioningFailedEvent = {
+      if (isFailure) {
+        this.logger.warn(`Simulating provisioning network failure for activation [${correlationId}]`);
+
+        await repo.save(
+          repo.create({
+            id: orderId,
+            activationId: correlationId,
+            customerId,
+            planId: payload.planId,
+            status: 'FAILED',
+            failureReason: 'Simulated network allocation timeout / HLR failure',
+          }),
+        );
+
+        const failedEvent: ProvisioningFailedEvent = {
+          eventId: uuidv4(),
+          eventType: 'ProvisioningFailed',
+          version: 1,
+          occurredAt: now,
+          correlationId,
+          customerId,
+          source: 'provisioning-service',
+          payload: {
+            reason: 'Network allocation timeout / HLR provisioning error',
+            planId: payload.planId,
+          },
+        };
+
+        await this.outboxService.addEvent(TOPICS.PROVISIONING_EVENTS, customerId, failedEvent, manager);
+        return;
+      }
+
+      await repo.save(
+        repo.create({
+          id: orderId,
+          activationId: correlationId,
+          customerId,
+          planId: payload.planId,
+          status: 'COMPLETED',
+        }),
+      );
+
+      this.logger.log(`Provisioning completed successfully [${orderId}] for activation [${correlationId}]`);
+
+      const completedEvent: ProvisioningCompletedEvent = {
         eventId: uuidv4(),
-        eventType: 'ProvisioningFailed',
+        eventType: 'ProvisioningCompleted',
         version: 1,
         occurredAt: now,
         correlationId,
         customerId,
         source: 'provisioning-service',
         payload: {
-          reason: 'Network allocation timeout / HLR provisioning error',
+          provisioningId: orderId,
           planId: payload.planId,
         },
       };
 
-      await this.outboxService.addEvent(
-        TOPICS.PROVISIONING_EVENTS,
-        customerId,
-        failedEvent,
-      );
-      return;
-    }
-
-    const orderId = `prov-${uuidv4().substring(0, 8)}`;
-    const order = this.repo.create({
-      id: orderId,
-      activationId: correlationId,
-      customerId,
-      planId: payload.planId,
-      status: 'COMPLETED',
+      await this.outboxService.addEvent(TOPICS.PROVISIONING_EVENTS, customerId, completedEvent, manager);
     });
-    await this.repo.save(order);
-
-    this.logger.log(`Provisioning completed successfully [${orderId}] for activation [${correlationId}]`);
-
-    const completedEvent: ProvisioningCompletedEvent = {
-      eventId: uuidv4(),
-      eventType: 'ProvisioningCompleted',
-      version: 1,
-      occurredAt: now,
-      correlationId,
-      customerId,
-      source: 'provisioning-service',
-      payload: {
-        provisioningId: orderId,
-        planId: payload.planId,
-      },
-    };
-
-    await this.outboxService.addEvent(
-      TOPICS.PROVISIONING_EVENTS,
-      customerId,
-      completedEvent,
-    );
   }
 }

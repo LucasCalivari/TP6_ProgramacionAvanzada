@@ -1,6 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource } from 'typeorm';
 import { v4 as uuidv4 } from 'uuid';
 import { BillingAccountEntity } from '../entities/billing-account.entity';
 import {
@@ -16,115 +15,132 @@ import { IdempotencyService, OutboxService } from '@activation-poc/kafka-toolkit
 @Injectable()
 export class BillingService {
   private readonly logger = new Logger(BillingService.name);
-  private cancelledActivationIds = new Set<string>();
+  private readonly consumerGroup = process.env.KAFKA_GROUP_ID || 'billing-svc';
 
   constructor(
-    @InjectRepository(BillingAccountEntity)
-    private readonly repo: Repository<BillingAccountEntity>,
+    private readonly dataSource: DataSource,
     private readonly idempotencyService: IdempotencyService,
     private readonly outboxService: OutboxService,
   ) {}
 
   async handleActivationRequested(event: ActivationRequestedEvent) {
     const { eventId, eventType, correlationId, customerId, payload } = event;
-
-    // Check idempotency (RNF-03)
-    const isNew = await this.idempotencyService.checkAndRecord(
-      eventId,
-      eventType,
-      process.env.KAFKA_GROUP_ID || 'billing-svc',
-    );
-    if (!isNew) {
-      this.logger.warn(`Event ${eventId} already processed by billing-service, skipping.`);
-      return;
-    }
-
     const now = new Date().toISOString();
 
-    // Check if failure is requested for billing
-    if (payload.simulateFailure === 'billing') {
-      this.logger.warn(`Simulating billing failure for activation [${correlationId}]`);
-      const failedEvent: BillingFailedEvent = {
+    // Idempotencia, efecto y evento de salida en la misma transacción (RNF-03)
+    await this.dataSource.transaction(async (manager) => {
+      const isNew = await this.idempotencyService.checkAndRecord(eventId, eventType, this.consumerGroup, manager);
+      if (!isNew) {
+        return;
+      }
+
+      const repo = manager.getRepository(BillingAccountEntity);
+
+      // Check if failure is requested for billing
+      if (payload.simulateFailure === 'billing') {
+        this.logger.warn(`Simulating billing failure for activation [${correlationId}]`);
+        const failedEvent: BillingFailedEvent = {
+          eventId: uuidv4(),
+          eventType: 'BillingFailed',
+          version: 1,
+          occurredAt: now,
+          correlationId,
+          customerId,
+          source: 'billing-service',
+          payload: {
+            reason: 'Simulated payment processing / billing rejection',
+            planId: payload.planId,
+          },
+        };
+
+        await this.outboxService.addEvent(TOPICS.BILLING_EVENTS, customerId, failedEvent, manager);
+        return;
+      }
+
+      // Caso borde: ActivationFailed llegó antes que ActivationRequested y ya dejó la
+      // cuenta registrada como CANCELLED. No se crea ni se factura nada.
+      const existing = await repo.findOne({ where: { activationId: correlationId } });
+      if (existing) {
+        this.logger.warn(
+          `Billing account for activation [${correlationId}] already exists with status ${existing.status}. Skipping creation.`,
+        );
+        return;
+      }
+
+      const billingAccountId = `bill-${uuidv4().substring(0, 8)}`;
+      await repo.save(
+        repo.create({
+          id: billingAccountId,
+          activationId: correlationId,
+          customerId,
+          planId: payload.planId,
+          status: 'CREATED',
+        }),
+      );
+
+      this.logger.log(`Billing account created: [${billingAccountId}] for activation: [${correlationId}]`);
+
+      const createdEvent: BillingAccountCreatedEvent = {
         eventId: uuidv4(),
-        eventType: 'BillingFailed',
+        eventType: 'BillingAccountCreated',
         version: 1,
         occurredAt: now,
         correlationId,
         customerId,
         source: 'billing-service',
         payload: {
-          reason: 'Simulated payment processing / billing rejection',
+          billingAccountId,
           planId: payload.planId,
         },
       };
 
-      await this.outboxService.addEvent(
-        TOPICS.BILLING_EVENTS,
-        customerId,
-        failedEvent,
-      );
-      return;
-    }
-
-    // Edge case: check if this activation was cancelled before creation arrived
-    const isPreCancelled = this.cancelledActivationIds.has(correlationId);
-
-    const billingAccountId = `bill-${uuidv4().substring(0, 8)}`;
-    const account = this.repo.create({
-      id: billingAccountId,
-      activationId: correlationId,
-      customerId,
-      planId: payload.planId,
-      status: isPreCancelled ? 'CANCELLED' : 'CREATED',
-      cancellationReason: isPreCancelled ? 'Pre-emptively cancelled by failed saga' : undefined,
+      await this.outboxService.addEvent(TOPICS.BILLING_EVENTS, customerId, createdEvent, manager);
     });
-
-    await this.repo.save(account);
-
-    if (isPreCancelled) {
-      this.logger.warn(`Created billing account [${billingAccountId}] as CANCELLED directly due to previous failure.`);
-      return;
-    }
-
-    this.logger.log(`Billing account created: [${billingAccountId}] for activation: [${correlationId}]`);
-
-    const createdEvent: BillingAccountCreatedEvent = {
-      eventId: uuidv4(),
-      eventType: 'BillingAccountCreated',
-      version: 1,
-      occurredAt: now,
-      correlationId,
-      customerId,
-      source: 'billing-service',
-      payload: {
-        billingAccountId,
-        planId: payload.planId,
-      },
-    };
-
-    await this.outboxService.addEvent(
-      TOPICS.BILLING_EVENTS,
-      customerId,
-      createdEvent,
-    );
   }
 
   async handleActivationFailed(event: ActivationFailedEvent) {
-    const { correlationId, customerId, payload } = event;
-    this.logger.log(`Compensating billing for failed activation: [${correlationId}]`);
+    const { eventId, eventType, correlationId, customerId, payload } = event;
 
-    this.cancelledActivationIds.add(correlationId);
+    await this.dataSource.transaction(async (manager) => {
+      const isNew = await this.idempotencyService.checkAndRecord(eventId, eventType, this.consumerGroup, manager);
+      if (!isNew) {
+        return;
+      }
 
-    const account = await this.repo.findOne({ where: { activationId: correlationId } });
-    if (!account) {
-      this.logger.log(`No billing account found yet for activation [${correlationId}]. Flagged for cancellation.`);
-      return;
-    }
+      // Si falló billing no hay cuenta que compensar
+      if (payload.failedStep === 'billing') {
+        return;
+      }
 
-    if (account.status === 'CREATED') {
+      this.logger.log(`Compensating billing for failed activation: [${correlationId}]`);
+      const repo = manager.getRepository(BillingAccountEntity);
+      const account = await repo.findOne({ where: { activationId: correlationId } });
+
+      if (!account) {
+        // ActivationRequested todavía no llegó: se deja la cuenta registrada como
+        // CANCELLED para que, cuando llegue, no se cree (persistente, sobrevive reinicios
+        // y funciona con varias instancias de billing)
+        await repo.save(
+          repo.create({
+            id: `bill-${uuidv4().substring(0, 8)}`,
+            activationId: correlationId,
+            customerId,
+            planId: 'unknown',
+            status: 'CANCELLED',
+            cancellationReason: `Pre-emptively cancelled: ${payload.reason}`,
+          }),
+        );
+        this.logger.warn(`No billing account yet for activation [${correlationId}]. Registered as pre-cancelled.`);
+        return;
+      }
+
+      if (account.status !== 'CREATED') {
+        return;
+      }
+
       account.status = 'CANCELLED';
       account.cancellationReason = payload.reason;
-      await this.repo.save(account);
+      await repo.save(account);
 
       this.logger.log(`Billing account [${account.id}] has been CANCELLED (Compensated)`);
 
@@ -142,11 +158,7 @@ export class BillingService {
         },
       };
 
-      await this.outboxService.addEvent(
-        TOPICS.BILLING_EVENTS,
-        customerId,
-        cancelledEvent,
-      );
-    }
+      await this.outboxService.addEvent(TOPICS.BILLING_EVENTS, customerId, cancelledEvent, manager);
+    });
   }
 }

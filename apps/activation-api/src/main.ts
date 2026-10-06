@@ -23,6 +23,10 @@ async function bootstrap() {
       consumer: {
         groupId: kafkaGroupId,
       },
+      // Sin offset commiteado, leer desde el inicio para no perder eventos publicados antes de que el consumer se una
+      subscribe: {
+        fromBeginning: true,
+      },
     },
   });
 

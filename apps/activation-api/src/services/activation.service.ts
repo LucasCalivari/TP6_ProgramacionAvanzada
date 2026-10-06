@@ -1,6 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, EntityManager, Repository } from 'typeorm';
 import { v4 as uuidv4 } from 'uuid';
 import {
   ActivationEntity,
@@ -9,22 +9,28 @@ import {
 import { ActivationGateway } from '../gateways/activation.gateway';
 import {
   TOPICS,
+  EventEnvelope,
   ActivationRequestedEvent,
   ActivationCompletedEvent,
   ActivationFailedEvent,
   FailureMode,
 } from '@activation-poc/contracts';
-import { OutboxService } from '@activation-poc/kafka-toolkit';
+import { IdempotencyService, OutboxService } from '@activation-poc/kafka-toolkit';
+
+type SagaStep = 'billing' | 'provisioning';
 
 @Injectable()
 export class ActivationService {
   private readonly logger = new Logger(ActivationService.name);
+  private readonly consumerGroup = process.env.KAFKA_GROUP_ID || 'activation-api-group';
 
   constructor(
     @InjectRepository(ActivationEntity)
     private readonly repo: Repository<ActivationEntity>,
+    private readonly dataSource: DataSource,
     private readonly gateway: ActivationGateway,
     private readonly outboxService: OutboxService,
+    private readonly idempotencyService: IdempotencyService,
   ) {}
 
   async createActivation(data: {
@@ -47,18 +53,6 @@ export class ActivationService {
       },
     };
 
-    const activation = this.repo.create({
-      id: activationId,
-      customerId: data.customerId,
-      planId: data.planId,
-      status: 'PENDING',
-      simulateFailure: data.simulateFailure || 'none',
-      steps: {},
-      history: [historyItem],
-    });
-
-    const saved = await this.repo.save(activation);
-
     const event: ActivationRequestedEvent = {
       eventId,
       eventType: 'ActivationRequested',
@@ -74,12 +68,25 @@ export class ActivationService {
       },
     };
 
-    // Save event in transactional outbox for reliable delivery
-    await this.outboxService.addEvent(
-      TOPICS.ACTIVATION_REQUESTED,
-      data.customerId,
-      event,
-    );
+    // Activación y evento en la misma transacción (outbox transaccional): si la API se
+    // cae entre medio, no queda una activación sin su ActivationRequested
+    const saved = await this.dataSource.transaction(async (manager) => {
+      const repo = manager.getRepository(ActivationEntity);
+      const activation = await repo.save(
+        repo.create({
+          id: activationId,
+          customerId: data.customerId,
+          planId: data.planId,
+          status: 'PENDING',
+          simulateFailure: data.simulateFailure || 'none',
+          steps: {},
+          history: [historyItem],
+        }),
+      );
+
+      await this.outboxService.addEvent(TOPICS.ACTIVATION_REQUESTED, data.customerId, event, manager);
+      return activation;
+    });
 
     this.logger.log(`Created activation [${activationId}] for customer [${data.customerId}]`);
     this.gateway.notifyActivationUpdate(saved, 'activation:created');
@@ -105,75 +112,77 @@ export class ActivationService {
     });
   }
 
-  async handleBillingResult(event: any) {
-    const activationId = event.correlationId;
-    const activation = await this.repo.findOne({ where: { id: activationId } });
-    if (!activation) {
-      this.logger.warn(`Received billing result for unknown activation: ${activationId}`);
-      return;
-    }
-
-    const isSuccess = event.eventType === 'BillingAccountCreated';
-    const now = new Date().toISOString();
-
-    activation.steps = activation.steps || {};
-    activation.steps.billing = {
-      status: isSuccess ? 'OK' : 'FAILED',
-      at: now,
-      details: event.payload,
-    };
-
-    activation.history = activation.history || [];
-    activation.history.push({
-      eventType: event.eventType,
-      at: now,
-      details: event.payload,
-    });
-
-    await this.evaluateSaga(activation, isSuccess, 'billing', event.payload?.reason);
+  async handleBillingResult(event: EventEnvelope) {
+    await this.handleStepResult(event, 'billing', event.eventType === 'BillingAccountCreated');
   }
 
-  async handleProvisioningResult(event: any) {
-    const activationId = event.correlationId;
-    const activation = await this.repo.findOne({ where: { id: activationId } });
-    if (!activation) {
-      this.logger.warn(`Received provisioning result for unknown activation: ${activationId}`);
-      return;
-    }
+  async handleProvisioningResult(event: EventEnvelope) {
+    await this.handleStepResult(event, 'provisioning', event.eventType === 'ProvisioningCompleted');
+  }
 
-    const isSuccess = event.eventType === 'ProvisioningCompleted';
-    const now = new Date().toISOString();
+  /**
+   * Aplica el resultado de un paso de la saga. Idempotencia, lectura con lock, cambio
+   * de estado y evento de salida van en una única transacción (RNF-03): un resultado
+   * repetido no duplica el historial ni vuelve a publicar ActivationCompleted/Failed.
+   */
+  private async handleStepResult(event: EventEnvelope, stepName: SagaStep, isSuccess: boolean) {
+    const updated = await this.dataSource.transaction(async (manager) => {
+      const isNew = await this.idempotencyService.checkAndRecord(
+        event.eventId,
+        event.eventType,
+        this.consumerGroup,
+        manager,
+      );
+      if (!isNew) {
+        return null;
+      }
 
-    activation.steps = activation.steps || {};
-    activation.steps.provisioning = {
-      status: isSuccess ? 'OK' : 'FAILED',
-      at: now,
-      details: event.payload,
-    };
+      const activation = await manager.getRepository(ActivationEntity).findOne({
+        where: { id: event.correlationId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!activation) {
+        this.logger.warn(`Received ${stepName} result for unknown activation: ${event.correlationId}`);
+        return null;
+      }
 
-    activation.history = activation.history || [];
-    activation.history.push({
-      eventType: event.eventType,
-      at: now,
-      details: event.payload,
+      const now = new Date().toISOString();
+      activation.steps = activation.steps || {};
+      activation.steps[stepName] = {
+        status: isSuccess ? 'OK' : 'FAILED',
+        at: now,
+        details: event.payload,
+      };
+
+      activation.history = activation.history || [];
+      activation.history.push({
+        eventType: event.eventType,
+        at: now,
+        details: event.payload,
+      });
+
+      return await this.evaluateSaga(manager, activation, isSuccess, stepName, event.payload?.reason);
     });
 
-    await this.evaluateSaga(activation, isSuccess, 'provisioning', event.payload?.reason);
+    // Se notifica a la UI recién después del commit
+    if (updated) {
+      this.gateway.notifyActivationUpdate(updated);
+    }
   }
 
   private async evaluateSaga(
+    manager: EntityManager,
     activation: ActivationEntity,
     currentStepSuccess: boolean,
-    stepName: 'billing' | 'provisioning',
+    stepName: SagaStep,
     failureReason?: string,
-  ) {
+  ): Promise<ActivationEntity> {
+    const repo = manager.getRepository(ActivationEntity);
     const now = new Date().toISOString();
 
     // If activation is already in final state (FAILED), just update history and return
     if (activation.status === 'FAILED') {
-      await this.repo.save(activation);
-      this.gateway.notifyActivationUpdate(activation);
-      return;
+      return await repo.save(activation);
     }
 
     // If current step failed, fail the saga immediately
@@ -199,16 +208,11 @@ export class ActivationService {
         details: failEvent.payload,
       });
 
-      await this.outboxService.addEvent(
-        TOPICS.ACTIVATION_EVENTS,
-        activation.customerId,
-        failEvent,
-      );
+      await this.outboxService.addEvent(TOPICS.ACTIVATION_EVENTS, activation.customerId, failEvent, manager);
 
-      const saved = await this.repo.save(activation);
+      const saved = await repo.save(activation);
       this.logger.error(`Activation [${activation.id}] marked as FAILED due to ${stepName}`);
-      this.gateway.notifyActivationUpdate(saved);
-      return;
+      return saved;
     }
 
     // Both steps succeeded
@@ -238,22 +242,17 @@ export class ActivationService {
         details: completedEvent.payload,
       });
 
-      await this.outboxService.addEvent(
-        TOPICS.ACTIVATION_EVENTS,
-        activation.customerId,
-        completedEvent,
-      );
+      await this.outboxService.addEvent(TOPICS.ACTIVATION_EVENTS, activation.customerId, completedEvent, manager);
 
-      const saved = await this.repo.save(activation);
+      const saved = await repo.save(activation);
       this.logger.log(`Activation [${activation.id}] successfully marked as ACTIVE!`);
-      this.gateway.notifyActivationUpdate(saved);
-      return;
+      return saved;
     }
 
     // One step completed OK, waiting for the other
     activation.status = 'IN_PROGRESS';
-    const saved = await this.repo.save(activation);
+    const saved = await repo.save(activation);
     this.logger.log(`Activation [${activation.id}] is IN_PROGRESS (waiting for complementary step)`);
-    this.gateway.notifyActivationUpdate(saved);
+    return saved;
   }
 }

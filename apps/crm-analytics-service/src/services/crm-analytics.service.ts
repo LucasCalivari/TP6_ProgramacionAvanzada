@@ -14,16 +14,17 @@ export class CrmAnalyticsService {
     private readonly repo: Repository<EventLogEntity>,
   ) {}
 
+  /**
+   * Idempotente por eventId (índice único en event_log), así un replay desde el
+   * inicio del topic no duplica registros (RF-10, RNF-03). Los errores se propagan
+   * para que DlqService reintente y, si persisten, mande el mensaje a la DLQ.
+   */
   async logEvent(topic: string, event: EventEnvelope) {
-    try {
-      // Check if already logged by eventId (idempotent logging)
-      const existing = await this.repo.findOne({ where: { eventId: event.eventId } });
-      if (existing) {
-        this.logger.debug(`Event [${event.eventId}] already in crm-analytics log, skipping.`);
-        return;
-      }
-
-      const entry = this.repo.create({
+    const result = await this.repo
+      .createQueryBuilder()
+      .insert()
+      .into(EventLogEntity)
+      .values({
         id: `crm-${uuidv4().substring(0, 8)}`,
         eventId: event.eventId,
         eventType: event.eventType,
@@ -31,14 +32,17 @@ export class CrmAnalyticsService {
         customerId: event.customerId,
         source: event.source,
         topic,
-        payload: event.payload,
-      });
+        payload: event.payload ?? {},
+      })
+      .orIgnore()
+      .returning(['eventId'])
+      .execute();
 
-      await this.repo.save(entry);
-      this.logger.log(`Logged event [${event.eventType}] (ID: ${event.eventId}) from topic [${topic}]`);
-    } catch (err: any) {
-      this.logger.error(`Failed to log event in CRM Analytics: ${err.message}`);
+    if (result.raw.length === 0) {
+      this.logger.debug(`Event [${event.eventId}] already in crm-analytics log, skipping.`);
+      return;
     }
+    this.logger.log(`Logged event [${event.eventType}] (ID: ${event.eventId}) from topic [${topic}]`);
   }
 
   async getAllLogs() {

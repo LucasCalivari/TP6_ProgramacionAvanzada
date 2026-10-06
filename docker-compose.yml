@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   kafka:
     image: apache/kafka:3.7.0
@@ -108,11 +106,14 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgrespassword
       DB_NAME: activation_db
+    restart: on-failure
     depends_on:
       kafka:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   billing-service:
     build:
@@ -127,11 +128,14 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgrespassword
       DB_NAME: billing_db
+    restart: on-failure
     depends_on:
       kafka:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   provisioning-service:
     build:
@@ -146,11 +150,14 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgrespassword
       DB_NAME: provisioning_db
+    restart: on-failure
     depends_on:
       kafka:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   notification-service:
     build:
@@ -167,11 +174,14 @@ services:
       DB_NAME: notification_db
       SMTP_HOST: mailhog
       SMTP_PORT: 1025
+    restart: on-failure
     depends_on:
       kafka:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       mailhog:
         condition: service_healthy
 
@@ -188,11 +198,33 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgrespassword
       DB_NAME: crm_analytics_db
+    restart: on-failure
     depends_on:
       kafka:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  # Escenario 5: consumidor nuevo que reprocesa el historial desde el inicio.
+  # No arranca con `docker compose up`; se levanta con:
+  #   docker compose --profile loyalty up -d loyalty-service
+  loyalty-service:
+    build:
+      context: .
+      dockerfile: apps/loyalty-service/Dockerfile
+    profiles: ["loyalty"]
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: loyalty-service
+      KAFKA_GROUP_ID: loyalty-svc
+    restart: on-failure
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   demo-ui:
     build:
