@@ -1,0 +1,26 @@
+{
+  "name": "activation-poc",
+  "version": "1.0.0",
+  "private": true,
+  "description": "POC Activación de Servicios con Kafka y PostgreSQL - UADER Programación Avanzada",
+  "workspaces": [
+    "libs/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:libs": "npm run build --workspace=libs/contracts --workspace=libs/kafka-toolkit",
+    "start:activation-api": "npm run start:dev --workspace=apps/activation-api",
+    "start:billing": "npm run start:dev --workspace=apps/billing-service",
+    "start:provisioning": "npm run start:dev --workspace=apps/provisioning-service",
+    "start:notification": "npm run start:dev --workspace=apps/notification-service",
+    "start:crm-analytics": "npm run start:dev --workspace=apps/crm-analytics-service",
+    "start:ui": "npm run dev --workspace=apps/demo-ui",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}

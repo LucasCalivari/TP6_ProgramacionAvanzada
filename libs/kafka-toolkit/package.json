@@ -1,0 +1,26 @@
+{
+  "name": "@activation-poc/kafka-toolkit",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@activation-poc/contracts": "*",
+    "@nestjs/common": "^10.3.8",
+    "@nestjs/core": "^10.3.8",
+    "@nestjs/microservices": "^10.3.8",
+    "@nestjs/typeorm": "^10.0.2",
+    "kafkajs": "^2.2.4",
+    "pg": "^8.11.5",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "typeorm": "^0.3.20"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "@types/pg": "^8.11.5",
+    "typescript": "^5.4.5"
+  }
+}
