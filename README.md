@@ -2,236 +2,142 @@
 
 Licenciatura en Sistemas de Información · Programación Avanzada 2026 · FCyT UADER
 
-Prueba de concepto de una arquitectura orientada a eventos: un cliente contrata un plan desde una UI en React y **un único evento en Kafka** dispara la facturación, el aprovisionamiento, la notificación por email y el registro en CRM, sin que ningún servicio llame directamente a otro. Si un paso falla, una saga coreografiada compensa lo hecho (anula la cuenta de facturación).
+## De qué se trata
 
-Alcance implementado: **fases 1, 2 y 3** del documento de arquitectura (`Docs/TP6 POC_Activacion_de_Servicios_con_Kafka.pdf`).
+Esta prueba de concepto muestra cómo resolver la activación de un plan con una arquitectura orientada a eventos. Un cliente contrata un plan desde una interfaz web y eso publica un único evento en Kafka. A partir de ese evento, la facturación, el aprovisionamiento, el envío de emails y el registro en el CRM reaccionan cada uno por su cuenta, sin que ningún servicio llame directamente a otro.
 
-## Stack
+Si alguno de los pasos falla, el sistema lo resuelve con una saga coreografiada: la activación se marca como fallida y el servicio de facturación anula la cuenta que había creado, todo mediante eventos.
 
-| Componente | Tecnología |
-|---|---|
-| Mensajería | Apache Kafka 3.7 en modo KRaft, 1 broker |
-| Servicios | NestJS 10 + `@nestjs/microservices` (transporte Kafka, kafkajs) |
-| Frontend | React + Vite + Tailwind + socket.io-client |
-| Persistencia | PostgreSQL 16, una base por servicio (ver nota abajo) |
-| Observabilidad | Kafka UI (kafbat) |
-| Email simulado | Mailhog |
-| Entorno | Docker Compose, monorepo con npm workspaces |
+El proyecto implementa las fases 1, 2 y 3 del documento de arquitectura que está en la carpeta Docs.
 
-> **Nota sobre la base de datos:** el documento propone MongoDB; se usó PostgreSQL con acuerdo de la cátedra. Las colecciones del documento se mapean a tablas (`activations`, `billing_accounts`, `provisioning_orders`, `notifications`, `event_log`, `outbox`, `processed_events`) y las transacciones ACID de Postgres cubren lo que en Mongo requería un replica set.
+## Tecnologías
+
+La mensajería usa Apache Kafka 3.7 en modo KRaft con un solo broker. Los servicios están hechos en NestJS 10 con el transporte de Kafka de `@nestjs/microservices`, que por debajo usa kafkajs. La interfaz es una aplicación React con Vite y Tailwind, que recibe las actualizaciones en vivo por WebSocket con socket.io. Para observar lo que pasa dentro de Kafka se incluye Kafka UI, y los emails se simulan con Mailhog. Todo corre con Docker Compose y el código está organizado como monorepo con npm workspaces.
+
+Como base de datos se usa PostgreSQL 16, con una base separada para cada servicio. El documento original proponía MongoDB, pero se usó PostgreSQL con el acuerdo de la cátedra. Las colecciones del documento pasaron a ser tablas, y las transacciones de Postgres cubren lo que en Mongo hubiera requerido configurar un replica set.
 
 ## Cómo levantarlo
 
-Requisito: Docker Desktop.
+Solo hace falta tener Docker Desktop instalado. Desde la carpeta del proyecto se ejecuta:
 
 ```bash
 docker compose up -d --build
 ```
 
-Un solo comando levanta todo (RNF-01). `kafka-init` crea los topics y los servicios esperan a que termine antes de arrancar.
+Ese único comando levanta todo. Primero arrancan Kafka y PostgreSQL, después un contenedor auxiliar llamado kafka-init crea los topics, y recién cuando termina arrancan los servicios. Conviene esperar alrededor de un minuto antes de usarlo.
 
-| URL | Qué es |
-|---|---|
-| http://localhost:5173 | Demo UI (contratar plan + timeline en vivo) |
-| http://localhost:3000/activations | API REST de activaciones |
-| http://localhost:8080 | Kafka UI: topics, mensajes, particiones, consumer groups y lag |
-| http://localhost:8025 | Mailhog: bandeja de entrada de los emails |
+La interfaz de la demo queda en http://localhost:5173, la API REST en http://localhost:3000/activations, Kafka UI en http://localhost:8080 y la bandeja de Mailhog en http://localhost:8025.
 
-Para bajar todo: `docker compose down` (agregar `-v` para borrar también los datos de Postgres).
+Para apagar todo se usa `docker compose down`. Si además se quiere borrar la base de datos y empezar de cero, se agrega la opción `-v`.
 
-## Arquitectura
+## Cómo funciona
 
-```
-Demo UI ──POST /activations──▶ activation-api ──▶ activation.requested
-   ▲                              │  ▲                 │
-   └──────── WebSocket ───────────┘  │        ┌────────┴────────┐
-                                     │        ▼                 ▼
-                                     │     billing        provisioning
-                                     │        │                 │
-                                     │  billing.events   provisioning.events
-                                     └────────┴────────┬────────┘
-                                                       ▼
-                        activation-api (agregador de la saga)
-                                                       │
-                                               activation.events
-                                  ┌────────────────┬───┴────────────┬──────────────┐
-                                  ▼                ▼                ▼              ▼
-                            notification     billing (compensa)  crm-analytics   loyalty
-                                                                 (todos los      (escenario 5)
-                                                                  topics)
-```
+El punto de entrada es activation-api. Cuando la interfaz pide una activación, este servicio la guarda con estado PENDING, responde enseguida con código 202 sin esperar a nadie, y publica el evento ActivationRequested en el topic activation.requested.
 
-| Servicio | Consume | Publica | Base |
-|---|---|---|---|
-| `activation-api` | `billing.events`, `provisioning.events` | `activation.requested`, `activation.events` | `activation_db` |
-| `billing-service` | `activation.requested`, `activation.events` | `billing.events` | `billing_db` |
-| `provisioning-service` | `activation.requested` | `provisioning.events` | `provisioning_db` |
-| `notification-service` | `activation.events` | — (envía email a Mailhog) | `notification_db` |
-| `crm-analytics-service` | los 4 topics | — | `crm_analytics_db` |
-| `loyalty-service` | `activation.events` (desde el inicio) | — | — (estado en memoria) |
+Ese evento lo reciben en paralelo billing-service y provisioning-service. Billing crea una cuenta de facturación simulada y publica BillingAccountCreated, o BillingFailed si se pidió simular un fallo. Provisioning simula el aprovisionamiento de la línea con una demora de uno a tres segundos y publica ProvisioningCompleted o ProvisioningFailed. Cada uno publica en su propio topic, billing.events y provisioning.events.
 
-Topics: `activation.requested`, `billing.events`, `provisioning.events`, `activation.events` y sus `<topic>.dlq`. Todos con 3 particiones, retención de 7 días y **`customerId` como clave**, así los eventos de un mismo cliente se procesan en orden (RNF-02).
+Activation-api escucha esos dos topics y actúa como agregador de la saga. Cuando llega el primer resultado, la activación pasa a IN_PROGRESS. Si los dos pasos salieron bien, pasa a ACTIVE y publica ActivationCompleted. Ante el primer fallo pasa a FAILED y publica ActivationFailed; los resultados que lleguen después solo se agregan al historial. Cada cambio se envía a la interfaz por WebSocket, y así se arma la línea de tiempo en vivo.
 
-Estados de una activación: `PENDING` → `IN_PROGRESS` (llegó el primer resultado) → `ACTIVE` (billing y provisioning OK) o `FAILED` (el primer fallo; los resultados posteriores solo se registran en el historial).
+Los eventos finales van al topic activation.events. Ahí los escucha notification-service, que manda el email de bienvenida o de error a Mailhog, y también billing-service, que ante un ActivationFailed anula la cuenta y publica BillingAccountCancelled. Esa es la compensación de la saga.
 
-## Estructura del repo
+Hay dos servicios más que solo escuchan. Crm-analytics-service lee todos los topics y guarda una copia de cada evento, lo que demuestra que se puede sumar un consumidor sin tocar a los demás. Loyalty-service acredita puntos por cada activación completada; no arranca con el resto porque está pensado para levantarse más tarde y mostrar cómo un consumidor nuevo puede reprocesar todo el historial.
 
-```
-apps/
-  activation-api/          REST + WebSocket + agregador de la saga
-  billing-service/
-  provisioning-service/
-  notification-service/
-  crm-analytics-service/
-  loyalty-service/         consumidor de replay (profile "loyalty")
-  demo-ui/                 React + Vite + socket.io-client
-libs/
-  contracts/               sobre común de eventos, tipos versionados, nombres de topics
-  kafka-toolkit/           idempotencia, reintentos + DLQ, outbox
-docker/
-  create-topics.sh, init-db.sql
-Docs/
-  architecture.md, demo-script.md, enunciado (PDF)
-docker-compose.yml
-```
+Todos los topics tienen tres particiones, retención de siete días y usan el customerId como clave. Gracias a eso, los eventos de un mismo cliente siempre caen en la misma partición y se procesan en orden. Cada topic tiene además su cola de mensajes muertos, con el mismo nombre terminado en .dlq.
 
-## Decisiones técnicas de confiabilidad
+Todos los eventos comparten el mismo formato, definido en la librería libs/contracts. Cada uno lleva un eventId único, el tipo de evento con su número de versión, la fecha, el correlationId (que es el id de la activación y permite seguirla de punta a punta), el customerId, el servicio que lo publicó y los datos propios del evento. Los nombres de los eventos están en pasado porque describen hechos que ya ocurrieron.
 
-### Idempotencia (RNF-03)
+## Organización del código
 
-Kafka entrega "al menos una vez", así que todo consumidor tolera duplicados:
+En la carpeta apps están los seis servicios NestJS y la interfaz React. En libs hay dos librerías compartidas: contracts, que define los eventos y los nombres de los topics, y kafka-toolkit, que concentra la lógica de idempotencia, reintentos, cola de mensajes muertos y outbox para no repetirla en cada servicio. La carpeta docker tiene el script que crea los topics y el que crea las bases de datos, y Docs contiene el enunciado, la descripción de la arquitectura y el guion de la demo.
 
-- Cada servicio registra el `eventId` en `processed_events` con `INSERT ... ON CONFLICT DO NOTHING`, **dentro de la misma transacción** que aplica el efecto (crear la cuenta, guardar la orden, actualizar la saga, enviar el email) y que encola el evento de salida en el outbox. Si el efecto falla, el rollback deshace también el registro y el reintento lo vuelve a procesar. Si el `eventId` ya estaba, el evento se descarta.
-- `crm-analytics` usa el índice único de `event_log.event_id`; `loyalty` deduplica en memoria.
-- Un proceso purga cada hora los `processed_events` de más de 7 días (igual a la retención de los topics).
+## Decisiones para que el flujo sea confiable
 
-Implementación: [`libs/kafka-toolkit/src/services/idempotency.service.ts`](libs/kafka-toolkit/src/services/idempotency.service.ts).
+Kafka garantiza que cada mensaje se entregue al menos una vez, lo que significa que un mismo evento puede llegar repetido. Por eso cada consumidor es idempotente. Al procesar un evento, el servicio registra su eventId en la tabla processed_events dentro de la misma transacción en la que aplica el efecto, ya sea crear la cuenta, guardar la orden, actualizar la saga o enviar el email. Si el eventId ya estaba registrado, el evento se descarta sin hacer nada. Y si el efecto falla, la transacción se deshace entera, así que el reintento lo procesa como si fuera la primera vez. Los registros de más de siete días se borran solos, porque pasado ese tiempo el evento ya no puede volver a llegar.
 
-### Reintentos y DLQ (RNF-04)
+Cuando el procesamiento de un mensaje falla por un error técnico, el consumidor lo reintenta tres veces, esperando uno, dos y cuatro segundos entre intento e intento. Si después de eso sigue fallando, publica el mensaje original en la cola de mensajes muertos de ese topic, con el motivo del error en los encabezados, y sigue con el próximo mensaje. De esta forma un mensaje roto nunca bloquea la partición. Los fallos simulados desde la interfaz no cuentan como errores técnicos: son resultados de negocio y se publican como BillingFailed o ProvisioningFailed.
 
-Todos los handlers de Kafka pasan por `DlqService.consume()`, que:
+Los servicios tampoco publican los eventos directamente. Los guardan en una tabla outbox dentro de la misma transacción que el cambio de estado, y un proceso aparte revisa esa tabla cada medio segundo y publica lo pendiente. Así, si un servicio se cae justo después de guardar, el evento no se pierde.
 
-1. Valida el sobre del evento (JSON válido y campos `eventId`, `eventType`, `correlationId`, `customerId`).
-2. Ejecuta el handler; si falla, reintenta 3 veces con espera creciente (1 s, 2 s, 4 s).
-3. Si sigue fallando, publica el mensaje original en `<topic>.dlq` con headers `x-dlq-reason`, `x-original-topic`, `x-original-partition`, `x-original-offset`, `x-consumer-group` y `x-dlq-attempts`, y **sigue con el siguiente mensaje**: la partición no se bloquea.
+Para que ningún servicio pierda mensajes si se cae, el offset se confirma recién después de procesar cada mensaje, y al volver el servicio retoma desde ahí. Además, un consumidor que se une por primera vez empieza a leer desde el principio del topic en lugar de saltearse lo que ya estaba publicado.
 
-Los fallos de negocio simulados (`simulateFailure`) no son errores técnicos: se publican como `BillingFailed` / `ProvisioningFailed` y no van a la DLQ.
+Hay un caso borde en la compensación. Si provisioning falla muy rápido, el ActivationFailed puede llegarle a billing antes que el pedido original. En ese caso billing deja registrada la cuenta como cancelada, y cuando llega el pedido ve que ya está anulada y no crea nada. Este registro queda en la base de datos, así que funciona aunque el servicio se reinicie o haya varias instancias de billing.
 
-Implementación: [`libs/kafka-toolkit/src/services/dlq.service.ts`](libs/kafka-toolkit/src/services/dlq.service.ts).
+## Guion de la demo
 
-### Outbox transaccional
+La demo se hace con la pantalla dividida: la interfaz a la izquierda y Kafka UI a la derecha. Son cinco escenarios y en total llevan menos de quince minutos.
 
-Los eventos no se publican directo: se guardan en la tabla `outbox` en la misma transacción que el cambio de estado, y un poller los publica cada 500 ms. Si un servicio se cae entre guardar y publicar, el evento no se pierde.
+En el primer escenario, el camino feliz, se contrata un plan sin fallo. La línea de tiempo muestra los cuatro eventos, la activación termina ACTIVE y llega el email de bienvenida a Mailhog. Esto muestra el fan-out: un solo evento produce varias reacciones independientes.
 
-### Sin pérdida de eventos (RNF-05)
+En el segundo escenario se contrata un plan con fallo en provisioning. La línea de tiempo muestra ProvisioningFailed, ActivationFailed y BillingAccountCancelled, y llega el email de error. Es la saga funcionando sin ninguna llamada directa entre servicios.
 
-- Los consumer groups commitean el offset recién después de que el handler termina (kafkajs con autocommit sobre `eachMessage`). Un servicio que se cae retoma desde el último offset confirmado.
-- `subscribe.fromBeginning: true`: un consumer group sin offset previo lee desde el inicio en vez de saltearse lo publicado antes de unirse.
-- Compose espera a que `kafka-init` cree los topics y reinicia los servicios ante una falla (`restart: on-failure`).
-
-### Caso borde de la compensación
-
-Si `ActivationFailed` (por fallo de provisioning) llega a billing **antes** que `ActivationRequested`, billing registra la cuenta como `CANCELLED`; cuando llega el pedido, ve la cuenta ya anulada y no crea nada. El registro se guarda en la base, así que sobrevive reinicios y funciona con varias instancias de billing.
-
-## Guion de la demo (5 escenarios)
-
-Pantalla dividida: Demo UI (http://localhost:5173) a la izquierda y Kafka UI (http://localhost:8080) a la derecha.
-
-| # | Escenario | Qué se hace | Qué se ve | Concepto |
-|---|---|---|---|---|
-| 1 | Camino feliz | Contratar un plan con "Ninguno (OK)" | Timeline con 4 eventos y estado ACTIVE; email de bienvenida en Mailhog | Fan-out |
-| 2 | Fallo y compensación | Contratar con "Fallo Provisioning" | `ProvisioningFailed` → `ActivationFailed` → `BillingAccountCancelled`; email de error | Saga sin llamadas directas |
-| 3 | Servicio caído | Detener notification, crear 3 activaciones, volver a levantarlo | Kafka UI muestra lag de 3 en `notification-svc-server`; al volver llegan los 3 emails | Offsets: nadie pierde mensajes |
-| 4 | Escalar | Levantar una segunda instancia de billing | Kafka UI reparte las 3 particiones entre 2 consumidores | Consumer groups y particiones |
-| 5 | Nuevo consumidor | Levantar `loyalty-service` | Sus logs acreditan puntos por todas las activaciones históricas | Replay del log |
-
-Comandos:
+En el tercer escenario se detiene el servicio de notificaciones, se crean tres activaciones y se lo vuelve a levantar. Mientras está caído, Kafka UI muestra que el grupo notification-svc-server tiene tres mensajes pendientes; al volver, llegan los tres emails. Esto demuestra que con los offsets nadie pierde mensajes. Los comandos son:
 
 ```bash
-# Escenario 3
 docker compose stop notification-service
-#   ...crear 3 activaciones desde la UI...
+```
+
+```bash
 docker compose start notification-service
+```
 
-# Escenario 4
+En el cuarto escenario se levanta una segunda instancia de billing. Al cabo de unos treinta segundos, Kafka UI muestra que el grupo billing-svc-server tiene dos miembros y que las tres particiones se repartieron entre ellos. Se levanta con el primer comando y se vuelve a una sola instancia con el segundo:
+
+```bash
 docker compose up -d --scale billing-service=2 billing-service
-docker compose up -d --scale billing-service=1 billing-service   # volver a 1
+```
 
-# Escenario 5 (consumer group nuevo con auto.offset.reset=earliest)
+```bash
+docker compose up -d --scale billing-service=1 billing-service
+```
+
+En el quinto escenario se levanta loyalty-service, un consumidor nuevo que lee desde el inicio del topic. En sus logs se ve cómo acredita puntos por todas las activaciones que se completaron antes de que existiera, sin afectar a ningún otro servicio. Es algo que con llamadas directas entre APIs no se podría hacer. Se levanta y se miran sus logs así:
+
+```bash
 docker compose --profile loyalty up -d loyalty-service
+```
+
+```bash
 docker compose logs -f loyalty-service
 ```
 
-> Nest agrega el sufijo `-server` al `groupId`: en Kafka UI los grupos se ven como `billing-svc-server`, `notification-svc-server`, `loyalty-svc-server`, etc.
+Un detalle a tener en cuenta: Nest le agrega el sufijo -server al nombre de cada consumer group, por eso en Kafka UI aparecen como billing-svc-server, notification-svc-server y así con los demás.
 
 ## Cómo verificar los criterios de aceptación
 
-### Un mensaje inválido termina en la DLQ y el flujo sigue
+Para comprobar que un mensaje inválido termina en la cola de mensajes muertos, se puede publicar un texto que no sea JSON en el topic activation.requested con este comando:
 
 ```bash
 echo 'C-1234:esto-no-es-json' | docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic activation.requested --property parse.key=true --property key.separator=:
 ```
 
-En los logs de billing/provisioning/crm-analytics se ven los 4 intentos (`Execution attempt 1..4 failed`) y luego `Sending failed event to DLQ`. El mensaje aparece en `activation.requested.dlq` (Kafka UI → Topics) con el motivo en los headers. Una activación creada inmediatamente después para el mismo cliente (misma partición) termina normalmente.
+En los logs de billing se ven los cuatro intentos fallidos y el envío a la cola. En Kafka UI, dentro del topic activation.requested.dlq, aparece el mensaje con el motivo del error en los encabezados. Si inmediatamente después se crea una activación para el cliente C-1234, que cae en la misma partición, termina normalmente: el mensaje roto no frenó a nadie.
 
-### Reenviar un evento ya procesado no duplica cuentas ni emails
+Para comprobar que reenviar un evento no genera duplicados, se puede copiar desde Kafka UI un mensaje que ya fue procesado, por ejemplo un ActivationCompleted, y volver a publicarlo en el mismo topic con la misma clave usando la opción Produce Message. No llega un email nuevo, no se crea otra cuenta de facturación y el historial de la activación no cambia. En los logs del servicio aparece el aviso de que el evento estaba duplicado y se descartó.
 
-Copiar desde Kafka UI un mensaje ya consumido (por ejemplo un `ActivationRequested` o un `ActivationCompleted`) y volver a producirlo en el mismo topic con la misma clave. La cantidad de filas en `billing_accounts`, `provisioning_orders`, `notifications` y los emails de Mailhog no cambia; en los logs aparece `Duplicate event detected ... Skipping`.
-
-```bash
-docker exec postgres psql -U postgres -d billing_db -c "select count(*) from billing_accounts"
-```
-
-### Rastreo por correlationId
-
-Todos los eventos llevan `correlationId` = id de la activación (RNF-06):
+Para seguir una activación de punta a punta alcanza con su id. La API lo devuelve con su historial completo en http://localhost:3000/activations/ seguido del id, y en la base de crm-analytics se pueden ver todos sus eventos de todos los topics con esta consulta, reemplazando act-XXXX por el id real:
 
 ```bash
-curl http://localhost:3000/activations/act-XXXX
 docker exec postgres psql -U postgres -d crm_analytics_db -c "select topic, event_type, received_at from event_log where correlation_id = 'act-XXXX' order by received_at"
 ```
 
-### Reprocesar el historial en crm-analytics (RF-10)
+Crm-analytics también puede reprocesar todo el historial desde el principio. Para eso se detiene el servicio, se espera alrededor de treinta segundos a que Kafka lo dé por desconectado, se mueve el offset de su grupo al inicio y se lo vuelve a levantar. Como guarda los eventos por su eventId, el reproceso no genera registros duplicados.
 
 ```bash
 docker compose stop crm-analytics-service
-# esperar ~30 s a que el grupo quede vacío (estado "Empty")
-docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --group crm-analytics-server --describe --state
+```
+
+```bash
 docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --group crm-analytics-server --reset-offsets --to-earliest --all-topics --execute
+```
+
+```bash
 docker compose start crm-analytics-service
 ```
 
-crm-analytics vuelve a leer todos los topics desde el offset 0; como es idempotente por `eventId`, `event_log` no se duplica.
+## La API
 
-## API
+La API tiene tres rutas. Con un POST a /activations se crea una activación enviando el customerId, el planId y opcionalmente el modo de fallo a simular, que puede ser none, billing o provisioning; responde con código 202, el id de la activación y el estado PENDING. Con un GET a /activations seguido de un id se obtiene el estado actual, el resultado de cada paso y el historial de eventos. Y con un GET a /activations se listan las últimas cincuenta activaciones. Además, por WebSocket en el mismo puerto se emiten los eventos activation:created y activation:update cada vez que una activación cambia.
 
-| Método | Ruta | Descripción |
-|---|---|---|
-| `POST` | `/activations` | Body `{ customerId, planId, simulateFailure?: "none" \| "billing" \| "provisioning" }`. Responde **202** con `{ activationId, status: "PENDING" }` sin esperar a los demás servicios. |
-| `GET` | `/activations/:id` | Estado actual, resultado de cada paso e historial de eventos. |
-| `GET` | `/activations` | Últimas 50 activaciones. |
+## Qué quedó fuera
 
-WebSocket (socket.io en el puerto 3000): eventos `activation:created` y `activation:update` con la activación completa.
-
-## Contrato de eventos
-
-Todos los eventos comparten el mismo sobre, definido en [`libs/contracts`](libs/contracts/src/index.ts) (RNF-07):
-
-```json
-{
-  "eventId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
-  "eventType": "ActivationRequested",
-  "version": 1,
-  "occurredAt": "2026-09-27T16:40:00Z",
-  "correlationId": "act-0001",
-  "customerId": "C-1234",
-  "source": "activation-api",
-  "payload": { "planId": "FLOW-FULL", "channel": "web", "simulateFailure": "none" }
-}
-```
-
-Eventos: `ActivationRequested`, `BillingAccountCreated`, `BillingFailed`, `BillingAccountCancelled`, `ProvisioningCompleted`, `ProvisioningFailed`, `ActivationCompleted`, `ActivationFailed`. Los nombres van en pasado; los cambios compatibles suman campos opcionales y los incompatibles suben `version`.
-
-## Fuera de alcance
-
-Fase 4 opcional: Schema Registry y trazas distribuidas (OpenTelemetry). Tampoco hay autenticación, alta disponibilidad ni pruebas de carga.
+No se implementó la fase 4, que el documento marca como opcional y que incluye Schema Registry y trazas distribuidas con OpenTelemetry. Tampoco forman parte de la prueba la autenticación de usuarios, la alta disponibilidad con varios brokers ni las pruebas de carga.
